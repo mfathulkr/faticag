@@ -4,14 +4,21 @@ import re
 import PyPDF2
 from nltk.tokenize import sent_tokenize
 import nltk
-import tempfile
-import base64
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
 
 # NLTK'nın gerekli veri setini indirme (ilk çalıştırmada gerekli)
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt')
+
+# Sentence-transformers modelini yükleme (hafif bir model seçildi)
+@st.cache_resource
+def load_model():
+    model = SentenceTransformer('paraphrase-MiniLM-L3-v2')  # Hafif bir model
+    return model
 
 def extract_text_from_pdf(pdf_file):
     """PDF dosyasından tam metni çıkarır."""
@@ -22,95 +29,93 @@ def extract_text_from_pdf(pdf_file):
         text += page.extract_text() + "\n"
     return text
 
-def find_section_by_keyword(text, keyword, context_size=10):
-    """
-    Verilen anahtar kelimeyi içeren bölümleri bulur ve bağlamıyla birlikte döndürür.
-    context_size: Anahtar kelimeyi içeren cümlenin öncesinde ve sonrasında kaç cümle alınacağını belirler
-    """
-    # Metni cümlelere bölme
+def split_text_into_chunks(text, chunk_size=200, overlap=50):
+    """Metni anlamlı parçalara böler."""
+    # Metni cümlelere ayır
     sentences = sent_tokenize(text)
     
-    # Anahtar kelimeyi içeren cümleleri bul
-    matching_indices = [i for i, sentence in enumerate(sentences) if keyword.lower() in sentence.lower()]
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    
+    for sentence in sentences:
+        current_chunk.append(sentence)
+        current_size += len(sentence)
+        
+        if current_size >= chunk_size:
+            # Chunk'ı tamamla ve listeye ekle
+            chunks.append(" ".join(current_chunk))
+            
+            # Çakışma için son birkaç cümleyi tut
+            current_chunk = current_chunk[-3:]  # Son 3 cümleyi tut
+            current_size = sum(len(s) for s in current_chunk)
+    
+    # Son chunk'ı ekle
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    
+    return chunks
+
+def semantic_search(model, query, chunks, top_k=5):
+    """Anlamsal olarak en benzer metinleri bulur."""
+    # Sorgu vektörünü hesapla
+    query_embedding = model.encode([query])[0]
+    
+    # Tüm chunk'ların vektörlerini hesapla
+    chunk_embeddings = model.encode(chunks)
+    
+    # Benzerliği hesapla (kosinüs benzerliği)
+    similarities = cosine_similarity([query_embedding], chunk_embeddings)[0]
+    
+    # En benzer top_k chunk'ı bul
+    top_indices = similarities.argsort()[-top_k:][::-1]
     
     results = []
-    for index in matching_indices:
-        # Önceki ve sonraki cümleleri belirle
-        start = max(0, index - context_size)
-        end = min(len(sentences), index + context_size + 1)
-        
-        # Bağlamla birlikte bölümü oluştur
-        section = " ".join(sentences[start:end])
-        results.append(section)
+    for idx in top_indices:
+        if similarities[idx] > 0.3:  # Minimum benzerlik eşiği
+            results.append({"text": chunks[idx], "score": similarities[idx]})
     
     return results
 
-def find_chapters_by_keyword(text, keyword):
-    """
-    Anahtar kelimeyi içeren bölüm başlıklarını ve içeriklerini bulmaya çalışır.
-    """
-    # Bölüm başlığı kalıpları - bunlar dokümantasyona göre ayarlanabilir
-    chapter_patterns = [
-        r'(?m)^(\d+\.\d*\s+.*?' + keyword + '.*?)$',  # 1.1 Keyword Title
-        r'(?m)^(Chapter\s+\d+\s*:?\s*.*?' + keyword + '.*?)$',  # Chapter 1: Keyword
-        r'(?m)^([A-Z][A-Z\s]+:?\s*.*?' + keyword + '.*?)$',  # UPPERCASE TITLE: Keyword
-        r'(?m)^(\d+\s+.*?' + keyword + '.*?)$',  # 1 Keyword Title
-    ]
-    
-    potential_chapters = []
-    for pattern in chapter_patterns:
-        matches = re.finditer(pattern, text, re.IGNORECASE)
-        for match in matches:
-            chapter_title = match.group(1)
-            # Başlık pozisyonunu bul
-            start_pos = match.start()
-            
-            # Sonraki bölüm başlığını bulma
-            next_chapter_pos = float('inf')
-            for p in chapter_patterns:
-                next_matches = re.finditer(p, text[start_pos + len(chapter_title):], re.IGNORECASE)
-                for next_match in next_matches:
-                    potential_next_pos = start_pos + len(chapter_title) + next_match.start()
-                    if potential_next_pos < next_chapter_pos:
-                        next_chapter_pos = potential_next_pos
-            
-            # Eğer sonraki bölüm bulunamazsa, metinin sonuna kadar al
-            if next_chapter_pos == float('inf'):
-                chapter_content = text[start_pos:]
-            else:
-                chapter_content = text[start_pos:next_chapter_pos]
-            
-            potential_chapters.append(chapter_content)
-    
-    return potential_chapters
-
-def process_pdf_with_keyword(pdf_file, keyword, context_size=10):
-    """PDF'ten anahtar kelimeye göre ilgili bölümleri çıkarır."""
+def process_pdf_with_semantic_search(pdf_file, query, top_k=5):
+    """PDF'ten anlamsal arama ile ilgili bölümleri çıkarır."""
     try:
         # PDF'ten metni çıkar
         full_text = extract_text_from_pdf(pdf_file)
         
-        # İlgili bölümleri bul
-        context_sections = find_section_by_keyword(full_text, keyword, context_size)
-        chapter_sections = find_chapters_by_keyword(full_text, keyword)
+        # Metni parçalara böl
+        chunks = split_text_into_chunks(full_text)
         
-        # Sonuçları birleştir
-        all_sections = context_sections + chapter_sections
+        if not chunks:
+            return f"PDF'den metin çıkarılamadı veya bölümler oluşturulamadı."
         
-        if not all_sections:
-            return f"'{keyword}' için ilgili bölüm bulunamadı."
+        # Model yükleme
+        model = load_model()
+        
+        # Anlamsal arama yap
+        results = semantic_search(model, query, chunks, top_k)
+        
+        if not results:
+            # Sonuç bulunamazsa, kelime tabanlı arama dene
+            keyword_results = []
+            for chunk in chunks:
+                if query.lower() in chunk.lower():
+                    keyword_results.append({"text": chunk, "score": 1.0})
+            
+            if keyword_results:
+                results = keyword_results[:top_k]
+        
+        if not results:
+            return f"'{query}' için ilgili bölüm bulunamadı."
         else:
-            # Sonuçları birleştir ve fazlalık varsa temizle
-            result = f"Anahtar Kelime: {keyword}\n\n"
+            # Sonuçları birleştir
+            result_text = f"Arama Sorgusu: {query}\n\n"
             
-            # Mükerrer içeriği önlemek için basit bir kontrol
-            unique_sections = []
-            for section in all_sections:
-                if not any(section in s for s in unique_sections):
-                    unique_sections.append(section)
+            for i, res in enumerate(results, 1):
+                result_text += f"--- Sonuç {i} (Benzerlik: {res['score']:.2f}) ---\n\n"
+                result_text += f"{res['text']}\n\n"
             
-            result += "\n\n---\n\n".join(unique_sections)
-            return result
+            return result_text
     
     except Exception as e:
         return f"İşlem sırasında hata oluştu: {str(e)}"
@@ -118,26 +123,9 @@ def process_pdf_with_keyword(pdf_file, keyword, context_size=10):
 # Streamlit Uygulaması
 st.set_page_config(page_title="Claude Dokümantasyon Asistanı", page_icon="📚", layout="wide")
 
-# CSS for copy button and styling
+# CSS styling
 st.markdown("""
 <style>
-    .copy-btn {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        background-color: #4CAF50;
-        color: white;
-        padding: 10px 24px;
-        font-size: 16px;
-        border: none;
-        border-radius: 4px;
-        cursor: pointer;
-        margin-top: 10px;
-        transition: background-color 0.3s;
-    }
-    .copy-btn:hover {
-        background-color: #45a049;
-    }
     .main-header {
         color: #1E88E5;
         font-size: 2.5rem;
@@ -165,7 +153,7 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.markdown('<h1 class="main-header">Claude Dokümantasyon Asistanı</h1>', unsafe_allow_html=True)
     st.markdown("""
-    PDF dokümanlarından anahtar kelimelere göre içerik çıkarıp Claude AI'ya aktarmanın en kolay yolu.
+    PDF dokümanlarından anlamsal arama yaparak içerik çıkarıp Claude AI'ya aktarmanın en akıllı yolu.
     """)
 
 with col2:
@@ -173,26 +161,38 @@ with col2:
 
 st.markdown('<h2 class="sub-header">PDF Yükle & İçerik Ara</h2>', unsafe_allow_html=True)
 
+with st.expander("✨ Yeni: Anlamsal Arama Özelliği", expanded=True):
+    st.markdown("""
+    **Artık arama sonuçları daha akıllı!** Yeni anlamsal arama özelliği sayesinde:
+    
+    - Tam kelime eşleşmesi yerine kavramsal benzerlik aranır
+    - Yazım hatalarına ve farklı ifade biçimlerine karşı daha dayanıklı
+    - Daha doğru ve kapsamlı sonuçlar elde edersiniz
+    
+    Bu özellik sayesinde, aradığınız bilgiler aynı kelimelerle ifade edilmemiş olsa bile bulabilirsiniz!
+    """)
+
 uploaded_file = st.file_uploader("PDF dokümanını sürükleyip bırakın veya seçin", type="pdf", 
                                  help="Sadece PDF dosyaları desteklenmektedir.")
 
 if uploaded_file is not None:
     pdf_name = uploaded_file.name
-    st.success(f"'{pdf_name}' başarıyla yüklendi! Şimdi anahtar kelime girin.")
+    st.success(f"'{pdf_name}' başarıyla yüklendi! Şimdi arama sorgunuzu girin.")
     
     col1, col2 = st.columns([3, 1])
     
     with col1:
-        keyword = st.text_input("Anahtar kelime", placeholder="Örn: PPO, Stable Baselines, Reinforcement Learning")
+        query = st.text_input("Arama sorgusu", 
+                     placeholder="Örn: PPO algoritması, DQN implementasyonu, Stable Baselines kullanımı")
     
     with col2:
-        context_size = st.slider("Bağlam büyüklüğü", min_value=3, max_value=30, value=10, 
-                              help="Anahtar kelime etrafında alınacak cümle sayısı")
+        top_k = st.slider("Sonuç sayısı", min_value=1, max_value=10, value=3, 
+                         help="Döndürülecek maksimum bölüm sayısı")
     
-    if keyword:
-        if st.button("Ara", key="search_button", use_container_width=True):
-            with st.spinner('İçerik aranıyor...'):
-                result = process_pdf_with_keyword(uploaded_file, keyword, context_size)
+    if query:
+        if st.button("Anlamsal Arama Yap", key="search_button", use_container_width=True):
+            with st.spinner('Anlamsal arama yapılıyor... İlk çalıştırmada model yüklemesi biraz zaman alabilir.'):
+                result = process_pdf_with_semantic_search(uploaded_file, query, top_k)
                 
                 # Sonuçları session_state'e kaydet
                 st.session_state.result = result
@@ -202,41 +202,16 @@ if uploaded_file is not None:
     if 'has_result' in st.session_state and st.session_state.has_result:
         st.markdown('<h2 class="sub-header">Sonuçlar</h2>', unsafe_allow_html=True)
         
-        # Textarea için bir ID belirle (JavaScript için)
-        text_area_id = "result-text-area"
+        # Sonucu kod bloğu olarak göster
+        st.code(st.session_state.result, language="text")
         
-        # Textarea içinde sonucu göster
-        st.text_area("Çıkarılan İçerik (Claude'a gönderilecek)", 
-                    st.session_state.result, 
-                    height=300,
-                    key=text_area_id)
-        
-        # Kopyalama butonu için JavaScript kodu
-        copy_js = f"""
-        <script>
-        function copyText() {{
-            const textArea = document.getElementById('{text_area_id}');
-            textArea.select();
-            document.execCommand('copy');
-            
-            // Kopyalama bildirimi
-            const copyBtn = document.getElementById('copyBtn');
-            copyBtn.innerHTML = '✓ Kopyalandı!';
-            setTimeout(function() {{
-                copyBtn.innerHTML = '📋 Tümünü Kopyala';
-            }}, 2000);
-        }}
-        </script>
-        <button id="copyBtn" class="copy-btn" onclick="copyText()">📋 Tümünü Kopyala</button>
-        """
-        
-        # JavaScript'i ekle
-        st.markdown(copy_js, unsafe_allow_html=True)
+        # Kopyalama talimatı
+        st.info("👆 Yukarıdaki kod bloğunun sağ üst köşesindeki kopyalama simgesini kullanarak tüm içeriği kopyalayabilirsiniz.")
         
         # Nasıl kullanılacağına dair ip uçları
         with st.expander("Claude ile nasıl kullanılır?", expanded=False):
             st.markdown("""
-            1. '📋 Tümünü Kopyala' butonuna tıklayın
+            1. Kod bloğunun sağ üst köşesindeki kopyalama simgesine tıklayın
             2. Claude sohbet penceresine gidin
             3. Aşağıdaki şablonu kullanabilirsiniz:
             
@@ -251,23 +226,65 @@ if uploaded_file is not None:
 
 # Sidebar bilgileri
 with st.sidebar:
+    st.title("CAG ve Bu Uygulama Hakkında")
+    
+    st.markdown("""
+    ## Claude Augmented Generation (CAG) Nedir?
+    
+    CAG, Claude'un kendi bilgi tabanı dışındaki özel içeriklerle desteklenmesini sağlayan özelliktir. 
+    Claude'un eğitim verilerinde bulunmayan veya güncel olmayan bilgileri, dışarıdan verilen 
+    dokümanlara dayalı olarak kullanabilmesini sağlar.
+    
+    ## Bu Uygulamanın Amacı
+    
+    Bu uygulama, Reinforcement Learning gibi teknik konulardaki PDF dokümanlarınızdan 
+    en alakalı kısımları semantik olarak çıkararak Claude'a aktarmanızı sağlar. 
+    Böylece Claude'u, kendi bilmediği spesifik dokümanlara dayalı bir uzmana dönüştürebilirsiniz.
+    
+    ## Token Penceresi Limiti
+    
+    Claude'un her sohbette işleyebileceği maksimum token sayısı sınırlıdır:
+    - Claude Opus: ~200K token
+    - Claude Sonnet: ~150K token
+    
+    Uzun PDF'lerin tamamını göndermek bu limiti aşabilir ve hafızanın yetersiz kalmasına yol açabilir.
+    Bu uygulama sayesinde sadece ilgili bölümleri çıkararak token limitini verimli kullanabilirsiniz.
+    
+    ## İlk Prompt Olarak Göndermenin Önemi
+    
+    Çıkarılan dokümantasyonu sohbetin **ilk mesajı** olarak göndermek kritik öneme sahiptir çünkü:
+    
+    1. Claude sohbetin başında verilen bilgileri daha iyi hatırlar
+    2. Tüm sohbet boyunca bu bilgilere referans verebilir
+    3. Konuyla alakalı sorularınıza dokümana dayalı, doğru yanıtlar alabilirsiniz
+    4. İlerleyen mesajlarda token limiti dolduğunda bile ilk bilgileri korur
+    
+    Böylece, karmaşık Reinforcement Learning kavramları hakkında dokümanlarınıza dayalı tutarlı ve doğru yanıtlar alabilirsiniz.
+    """)
+    
+    st.markdown("---")
+    
+   
+    
     st.title("Nasıl Kullanılır?")
     st.markdown("""
     1. **PDF Yükle**: Dokümanınızı sürükleyip bırakın
-    2. **Anahtar Kelime Girin**: Aramak istediğiniz terimi yazın
+    2. **Arama Sorgusu Girin**: Ne hakkında bilgi aradığınızı yazın
     3. **Ara**: Butona tıklayarak içeriği çıkarın
-    4. **Kopyala**: '📋 Tümünü Kopyala' butonuyla içeriği kopyalayın
+    4. **Kopyala**: Kod bloğunun sağ üst köşesindeki kopyalama simgesini kullanın
     5. **Claude'a Gönder**: Kopyaladığınız içeriği Claude AI'ya yapıştırın
     """)
     
     st.markdown("---")
     
-    st.subheader("Neden Bu Araç?")
+    st.subheader("Anlamsal Arama Hakkında")
     st.markdown("""
-    • Claude'un bilgi tabanını genişletir
-    • Özel dokümantasyonlarla çalışmanızı sağlar
-    • İstediğiniz PDF'ten içerik çıkararak AI'ya aktarabilirsiniz
-    • Teknik bilgileri kolayca AI modellerine sunabilirsiniz
+    Bu uygulama, geleneksel kelime eşleşmesi yerine **anlamsal arama** kullanır:
+    
+    • Aradığınız kelimelerin birebir aynısı olmasa da ilgili içerikleri bulur
+    • Kavramsal benzerliğe dayalı çalışır
+    • Örneğin "Python'da veri analizi" araması yaptığınızda "pandas kütüphanesi ile DataFrame işlemleri" gibi sonuçlar bulabilir
+    • Yazım hatalarına ve farklı ifade biçimlerine karşı daha dayanıklıdır
     """)
 
 # Ana sayfa açıklaması (uploaded_file yoksa)
@@ -278,21 +295,20 @@ if uploaded_file is None:
     with col1:
         st.subheader("İşleyiş")
         st.markdown("""
-        1. PDF dosyanızı yükleyin (teknik doküman, API referansı, kullanım kılavuzu vb.)
-        2. Aramak istediğiniz anahtar kelimeyi girin
-        3. Uygulama PDF'ten ilgili bölümleri çıkarır
+        1. PDF dosyanızı yükleyin (teknik doküman, API referansı, makale vb.)
+        2. Aramak istediğiniz konuyu veya kavramı doğal dilde ifade edin
+        3. Uygulama PDF'ten anlamsal olarak en ilgili bölümleri çıkarır
         4. Çıkarılan içeriği Claude'a göndererek uzman bir asistana dönüştürün
         """)
     
     with col2:
         st.subheader("Kullanım Örnekleri")
         st.markdown("""
-        • **Stable Baselines 3** dokümantasyonundan PPO algoritması hakkında bilgi çıkarma
-        • **PyTorch** kılavuzundan LSTM yapıları hakkında detayları çıkarma
-        • **Gymnasium** dokümantasyonundan özel ortamlar oluşturma kılavuzunu çıkarma
-        • **Research Papers** veya makalelerden belirli yöntemler hakkında bilgi çıkarma
+        • Teknik dokümantasyondan "asenkron işlem yönetimi" hakkında bölümleri bulma
+        • Bilimsel bir makaleden "deneysel sonuçlar ve bulgular" kısmını çıkarma
+        • Kitaptan "konunun pratik uygulamaları" hakkındaki açıklamaları bulma
         """)
 
 # Footer
 st.markdown("---")
-st.markdown("📚 Claude Dokümantasyon Asistanı | Pekiştirmeli Öğrenme ve AI Modelleriniz için en iyi dokümantasyon aracı")
+st.markdown("Claude Dokümantasyon Asistanı | Semantik arama özelliği ile en akıllı PDF içerik çıkarma aracı")
