@@ -8,11 +8,15 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 
-# NLTK'nın gerekli veri setini indirme (ilk çalıştırmada gerekli)
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+
+# NLTK'nın gerekli veri setlerini indirme (ilk çalıştırmada gerekli)
+nltk_resources = ['punkt', 'punkt_tab']
+
+for resource in nltk_resources:
+    try:
+        nltk.data.find(f'tokenizers/{resource}')
+    except LookupError:
+        nltk.download(resource)
 
 # Sentence-transformers modelini yükleme (hafif bir model seçildi)
 @st.cache_resource
